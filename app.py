@@ -35,6 +35,7 @@ class Card:
         self.soul = soul
         self.effects = []
         self.has_shot_trigger = False
+        self.last_cancelled_amount = 0  # 记录刚刚被取消的伤害
 
 class Effect:
     def __init__(self, trigger, action_func, max_uses=99):
@@ -46,6 +47,7 @@ class Effect:
 class GameEngine:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.force_trigger = cfg.get("p_force_trigger", False)
         self.all_active_cards = []
         
         # --- 1. 构建对手场面与资源 ---
@@ -201,6 +203,8 @@ class GameEngine:
             print(f"  🛡️ [伤害结果] 翻出 CX！ 发起的 {amount} 点伤害被【取消】。")
             self.opp_waiting_room.extend(res_zone)
             if source_card:
+                # 🌟 记录刚刚被取消的伤害数值
+                source_card.last_cancelled_amount = amount 
                 self.check_triggers("OnDamageCancel", source_card)
             return False
         else:
@@ -293,7 +297,8 @@ class GameEngine:
         for card in self.all_active_cards:
             for eff in card.effects:
                 if eff.trigger == trigger_type:
-                    if trigger_type in ["OnAttack", "OnPlay", "OnCancel"]:
+                    # 🌟 加上 OnDamageCancel，确保谁被取消了，谁才触发！
+                    if trigger_type in ["OnAttack", "OnPlay", "OnCancel", "OnDamageCancel"]:
                         if card != current_card: continue 
                     if trigger_type in ["OnOtherAttack", "OnOtherPlay"]:
                         if card == current_card: continue
@@ -307,6 +312,10 @@ class GameEngine:
     # ----------------------------------------------------
     def evaluate_condition(self, cond):
         """通用战局条件解析器：执行嵌套算术与逻辑运算"""
+        # 🌟 新增：如果开启了上帝模式，无视任何条件直接返回 True
+        if getattr(self, "force_trigger", False):
+            return True
+
         if not cond: return True
         
         if "operator" in cond:
@@ -324,6 +333,8 @@ class GameEngine:
         if target == "opp_level": actual_val = getattr(self, "opp_level", 0)
         elif target == "opp_clock": actual_val = len(getattr(self, "opp_clock_zone", []))
         elif target == "my_level": actual_val = getattr(self, "player_level", 0)
+        elif target == "opp_stock": actual_val = getattr(self, "opp_stock", 0)
+        elif target == "player_hand": actual_val = getattr(self, "player_hand", 0)
 
         if cmp == "==": return actual_val == value
         elif cmp == ">=": return actual_val >= value
@@ -356,14 +367,42 @@ class GameEngine:
             
             if op == "DealDamage":
                 amount = inst.get("amount", 1)
+                
+                # 🌟 如果伤害值是 "last_cancelled"，则动态读取
+                if amount == "last_cancelled":
+                    amount = getattr(source_card, "last_cancelled_amount", 0)
+                
                 print(f"👉 [技能执行] {source_card.name} 发动效果，造成 {amount} 点伤害")
                 self.deal_damage(amount, source_card=source_card)
                 
             elif op == "Heal":
                 amount = inst.get("amount", 1)
                 for _ in range(amount):
-                    if getattr(self, "player_clock", None):
-                        self.player_waiting_room.append(self.player_clock.pop())
+                    if getattr(self, "player_clock_zone", []):
+                        self.player_waiting_room.append(self.player_clock_zone.pop())
+
+            # ==========================================
+            # 🌟 新增指令：处理对手区资源互换 (洗费/洗坟)
+            elif op == "StockSwap":
+                stock_count = getattr(self, "opp_stock", 0)
+                if stock_count > 0:
+                    print(f"  🌪️ [效果执行] {source_card.name} 发动效果：将对方 {stock_count} 张 Stock 全部放置到休息室，并从牌组顶放置同等数量的卡牌！")
+                    self.opp_stock = 0
+                    for _ in range(stock_count):
+                        if not self.opp_deck: self.refresh_opp()
+                        if self.opp_deck:
+                            self.opp_waiting_room.append(self.opp_deck.pop(0))
+                    self.opp_stock = stock_count
+                    
+            elif op == "ReverseShuffle":
+                amount = inst.get("amount", 3)
+                print(f"  🌀 [效果执行] {source_card.name} 发动效果：将对方休息室最多 {amount} 张卡牌洗回牌组！")
+                cards_to_return = []
+                for _ in range(min(amount, len(self.opp_waiting_room))):
+                    cards_to_return.append(self.opp_waiting_room.pop())
+                self.opp_deck.extend(cards_to_return)
+                random.shuffle(self.opp_deck)
+            # ==========================================
                         
             elif op == "CheckCondition":
                 zone = inst.get("zone")
@@ -411,8 +450,61 @@ class GameEngine:
             elif op == "FilterDeck":
                 pass
 
+            # ==========================================
+            # 🌟 修复 4：超级嵌套逻辑 —— 贴膜/赋予技能
+            elif op == "GiveEffect":
+                target_type = inst.get("target", "any_character")
+                
+                # 智能贴膜寻敌逻辑 (左 -> 中 -> 右)
+                targets = []
+                if target_type == "other_character":
+                    front_row = self.all_active_cards[:3] 
+                    my_idx = front_row.index(source_card) if source_card in front_row else -1
+                    
+                    if my_idx != -1:
+                        for i in range(my_idx + 1, len(front_row)):
+                            if front_row[i] != source_card:
+                                targets.append(front_row[i])
+                                
+                        if not targets:
+                            for i in range(0, my_idx):
+                                if front_row[i] != source_card:
+                                    targets.append(front_row[i])
+                                    
+                    if not targets:
+                        targets = [c for c in self.all_active_cards if c != source_card]
+                else:
+                    targets = [source_card]
+                
+                if not targets: continue
+                target_card = targets[0] # 取最优解顺位
+                
+                # 处理魂加成
+                if "soul_boost" in inst:
+                    boost = inst.get("soul_boost", 0)
+                    target_card.soul += boost
+                    print(f"  ✨ [Buff赋予] {source_card.name} 给 {target_card.name} 魂+{boost}！")
+
+                # 处理技能贴膜 (嵌套解析)
+                new_eff_json = inst.get("effect")
+                if new_eff_json:
+                    trigger_name = new_eff_json.get("trigger")
+                    limit = new_eff_json.get("limit", 1)
+                    sub_instructions = new_eff_json.get("instructions", [])
+                    
+                    def make_instruction_action(inst_array):
+                        return lambda eng, c, insts=inst_array: eng.execute_instructions(insts, c)
+                        
+                    target_card.effects.append(Effect(
+                        trigger_name,
+                        make_instruction_action(sub_instructions),
+                        max_uses=limit
+                    ))
+                    print(f"  ✨ [技能贴膜] {source_card.name} 赋予了 {target_card.name} 技能 [{trigger_name}] (限{limit}次)！")       
+
+
 # ==========================================
-# 2. 数据处理：极简版卡牌构造器 (纯净无依赖)
+# 2. 数据处理：极简版卡牌构造器 (支持用户手动多选)
 # ==========================================
 @st.cache_data
 def load_db():
@@ -435,11 +527,12 @@ def load_db():
 RAW_DB = load_db()
 CARD_OPTIONS = ["无 (Empty)"] + list(RAW_DB.keys())
 
-def create_card_instance(display_key, soul, max_uses=99):
+def create_card_instance(display_key, soul, max_uses=99, user_choices=None):
     """
-    现在是最纯净的解析器，只认识 instructions 结构！
-    旧的 ACTION_MAP 兼容代码已全部切除。
+    现在支持多选卡片的分支注入！
+    user_choices 格式例: { 1: 0, 2: 1 } (第2个效果选第0项，第3个效果选第1项)
     """
+    if user_choices is None: user_choices = {}
     if display_key not in RAW_DB: 
         return None
     
@@ -453,11 +546,26 @@ def create_card_instance(display_key, soul, max_uses=99):
         soul=soul
     )
     
-    for eff_data in data.get("effects", []):
-        if isinstance(eff_data, dict) and "instructions" in eff_data:
+    for i, eff_data in enumerate(data.get("effects", [])):
+        if isinstance(eff_data, dict):
             trigger_name = eff_data.get("trigger", "OnAttack")
-            current_max_uses = eff_data.get("max_uses", max_uses)
-            instructions = eff_data["instructions"]
+            
+            # 防死循环锁！
+            if max_uses != 99:
+                current_max_uses = max_uses 
+            else:
+                current_max_uses = eff_data.get("limit", 1) 
+            
+            # 🌟 动态抽取指令: 如果这是张多选卡，则抽取玩家在 UI 里选的那个战术分支
+            if eff_data.get("is_choice"):
+                choice_idx = user_choices.get(i, 0)
+                choices_array = eff_data.get("choices", [])
+                if choice_idx < len(choices_array):
+                    instructions = choices_array[choice_idx].get("instructions", [])
+                else:
+                    instructions = []
+            else:
+                instructions = eff_data.get("instructions", [])
             
             def make_instruction_action(inst_array):
                 return lambda eng, c, insts=inst_array: eng.execute_instructions(insts, c)
@@ -470,15 +578,16 @@ def create_card_instance(display_key, soul, max_uses=99):
             
     return card
 
+
 # ==========================================
-# 3. Streamlit UI 构建 (保持不变)
+# 3. Streamlit UI 构建 
 # ==========================================
 st.set_page_config(page_title="WS专业斩杀演算", layout="wide")
 st.markdown("""
     <style>
     .stButton > button { border-color: #ff4b4b; color: #ff4b4b; float: right; }
     .stButton > button:hover { background-color: #ff4b4b; color: white; }
-    .metric-card { background-color: #f0f2f6; padding: 15px; border-radius: 10px; border-left: 5px solid #ff4b4b; }
+    .metric-card { background-color: #f0f2f6; padding: 15px; border-radius: 10px; border-left: 5px solid #ff4b4b; margin-top: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -487,6 +596,11 @@ st.title("🗡️ Weiss Schwarz 终盘斩杀演算 (专业赛级)")
 cfg = {}
 
 with st.sidebar:
+    st.header("⚙️ 全局设置")
+    # 🌟 新增：UI 开关，默认开启
+    cfg["p_force_trigger"] = st.checkbox("🔥 开启上帝模式 (忽略效果发动条件)", True)
+
+    st.divider()
     st.header("🎯 对方（防守方）状态")
     cfg["o_advanced"] = st.checkbox("🔮 开启精确录入已知公开区域 (算牌)", False, key="o_adv")
     
@@ -613,6 +727,7 @@ def render_slot(col, label, suffix, is_event=False, def_val=2):
     if sel_key not in st.session_state: st.session_state[sel_key] = "无 (Empty)"
     if val_key not in st.session_state: st.session_state[val_key] = def_val
 
+    user_choices = {}
     with col:
         h_l, h_r = st.columns([3, 1])
         h_l.write(f"**{label}**")
@@ -621,24 +736,35 @@ def render_slot(col, label, suffix, is_event=False, def_val=2):
         v_lbl = "效果/事件发动次数" if is_event else "攻击基础魂点"
         st.caption(v_lbl)
         val = st.number_input(v_lbl, 0, 10, key=val_key, label_visibility="collapsed")
+        
         if sel != "无 (Empty)":
-            img = RAW_DB[sel].get("image")
+            card_data = RAW_DB[sel]
+            img = card_data.get("image")
             if img: st.image(img, use_container_width=True)
-        else: st.info("空槽位")
-    return sel, val
+            
+            # 🌟 动态渲染下拉战术菜单！(如果你在 JSON 里配了原版文字，这里就会显示原版文字)
+            for i, eff in enumerate(card_data.get("effects", [])):
+                if eff.get("is_choice"):
+                    options = [c.get("label", f"效果选项 {j+1}") for j, c in enumerate(eff.get("choices", []))]
+                    choice_label = st.selectbox(f"⚙️ {eff.get('trigger')} 发动战术", options, key=f"choice_{suffix}_{i}")
+                    user_choices[i] = options.index(choice_label)
+        else: 
+            st.info("空槽位")
+            
+    return sel, val, user_choices
 
 st.subheader("⚔️ 前排攻击 Stage")
 f1, f2, f3 = st.columns(3)
-p1 = render_slot(f1, "左列", "p1", def_val=2)
-p2 = render_slot(f2, "中列", "p2", def_val=2)
-p3 = render_slot(f3, "右列", "p3", def_val=2)
+p1_name, p1_val, p1_choices = render_slot(f1, "左列", "p1", def_val=2)
+p2_name, p2_val, p2_choices = render_slot(f2, "中列", "p2", def_val=2)
+p3_name, p3_val, p3_choices = render_slot(f3, "右列", "p3", def_val=2)
 
 st.divider()
 st.subheader("⛺ 后排支援 & 事件")
 b1, b2, ev = st.columns(3)
-s1 = render_slot(b1, "左后支援", "b1", def_val=0)
-s2 = render_slot(b2, "右后支援", "b2", def_val=0)
-e1 = render_slot(ev, "⭐ 特殊事件/效果栏", "e1", is_event=True, def_val=1)
+s1_name, s1_val, s1_choices = render_slot(b1, "左后支援", "b1", def_val=0)
+s2_name, s2_val, s2_choices = render_slot(b2, "右后支援", "b2", def_val=0)
+e1_name, e1_val, e1_choices = render_slot(ev, "⭐ 特殊事件/效果栏", "e1", is_event=True, def_val=1)
 
 st.divider()
 iters = st.number_input("模拟演算次数", min_value=1, max_value=100000, value=1, step=1)
@@ -657,15 +783,16 @@ if st.button("🚀 开始斩杀演算", use_container_width=True):
             attackers = []
             supports = []
             
-            for name, val in [p1, p2, p3]:
+            # 🌟 传入选择好的下拉框战术 (user_choices)
+            for name, val, choices in [(p1_name, p1_val, p1_choices), (p2_name, p2_val, p2_choices), (p3_name, p3_val, p3_choices)]:
                 if name != "无 (Empty)":
-                    card_obj = create_card_instance(name, val, max_uses=99)
+                    card_obj = create_card_instance(name, val, max_uses=99, user_choices=choices)
                     if card_obj: attackers.append(card_obj)
             
-            for idx, (name, val) in enumerate([s1, s2, e1]):
+            for idx, (name, val, choices) in enumerate([(s1_name, s1_val, s1_choices), (s2_name, s2_val, s2_choices), (e1_name, e1_val, e1_choices)]):
                 if name != "无 (Empty)":
                     max_u = val if idx == 2 else 99 
-                    card_obj = create_card_instance(name, 0, max_uses=max_u)
+                    card_obj = create_card_instance(name, 0, max_uses=max_u, user_choices=choices)
                     if card_obj: supports.append(card_obj)
             
             engine.all_active_cards.extend(attackers + supports)
